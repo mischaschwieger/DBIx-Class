@@ -23,6 +23,13 @@ sub _determine_supports_insert_returning {
   ;
 }
 
+sub _determine_supports_update_returning {
+  return shift->_server_info->{normalized_dbms_version} >= 8.002
+    ? 1
+    : 0
+  ;
+}
+
 sub with_deferred_fk_checks {
   my ($self, $sub) = @_;
 

@@ -551,9 +551,10 @@ sub update {
 
   $self->throw_exception( "Not in database" ) unless $self->in_storage;
 
-  my $rows = $self->result_source->storage->update(
+  my ($rows, $retrieved_columns) = $self->result_source->storage->update(
     $self->result_source, \%to_update, $self->_storage_ident_condition
   );
+
   if ($rows == 0) {
     $self->throw_exception( "Can't update ${self}: row not found" );
   } elsif ($rows > 1) {
@@ -562,6 +563,18 @@ sub update {
   $self->{_dirty_columns} = {};
   $self->{related_resultsets} = {};
   delete $self->{_column_data_in_storage};
+
+  # UPDATE ... RETURNING: returns hashref { $column_name => $raw_column_data }
+  if ( $retrieved_columns && ref($retrieved_columns) eq 'HASH' ){
+      my %column_data  = %$retrieved_columns;
+      my $columns_info = $self->columns_info;
+      for my $column_name ( grep{ $columns_info->{ $_ }->{ _inflate_column } }keys %column_data ){
+          $column_data{ $column_name } =
+              $columns_info->{ $column_name }->{ _inflate_column }->{ inflate }->( $column_data{ $column_name }, $self );
+      }
+      $self->set_inflated_columns(\%column_data);
+  }
+
   return $self;
 }
 
