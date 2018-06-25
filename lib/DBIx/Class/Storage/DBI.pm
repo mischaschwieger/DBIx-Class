@@ -63,6 +63,8 @@ my @capabilities = (qw/
   insert_returning
   insert_returning_bound
 
+  update_returning
+
   multicolumn_in
 
   placeholders
@@ -1090,7 +1092,6 @@ sub set_dbms_capability {
 
 sub get_dbms_capability {
   my ($self, $capname) = @_;
-
   my $cap = $self->_dbh_details->{capability}{$capname};
 
   unless (defined $cap) {
@@ -1978,30 +1979,7 @@ sub insert {
   my %returned_cols = %$to_insert;
   if (my $retlist = $sqla_opts->{returning}) {  # if IR is supported - we will get everything in one set
 
-    unless( @ir_container ) {
-      try {
-
-        # FIXME - need to investigate why Caelum silenced this in 4d4dc518
-        local $SIG{__WARN__} = sub {};
-
-        @ir_container = $sth->fetchrow_array;
-        $sth->finish;
-
-      } catch {
-        # Evict the $sth from the cache in case we got here, since the finish()
-        # is crucial, at least on older Firebirds, possibly on other engines too
-        #
-        # It would be too complex to make this a proper subclass override,
-        # and besides we already take the try{} penalty, adding a catch that
-        # triggers infrequently is a no-brainer
-        #
-        if( my $kids = $self->_dbh->{CachedKids} ) {
-          $kids->{$_} == $sth and delete $kids->{$_}
-            for keys %$kids
-        }
-      };
-    }
-
+    @ir_container = $self->_fetch_sth_returning($sth) unless @ir_container;
     @returned_cols{@$retlist} = @ir_container if @ir_container;
   }
   else {
@@ -2041,6 +2019,35 @@ sub insert {
   }
 
   return { %$prefetched_values, %returned_cols };
+}
+
+sub _fetch_sth_returning {
+  my $self = shift;
+  my $sth  = shift or return;
+
+  try {
+
+    # FIXME - need to investigate why Caelum silenced this in 4d4dc518
+    local $SIG{__WARN__} = sub {};
+
+    my @result = $sth->fetchrow_array;
+    $sth->finish;
+    return @result;
+
+  } catch {
+    # Evict the $sth from the cache in case we got here, since the finish()
+    # is crucial, at least on older Firebirds, possibly on other engines too
+    #
+    # It would be too complex to make this a proper subclass override,
+    # and besides we already take the try{} penalty, adding a catch that
+    # triggers infrequently is a no-brainer
+    #
+    if( my $kids = $self->_dbh->{CachedKids} ) {
+      $kids->{$_} == $sth and delete $kids->{$_}
+        for keys %$kids;
+    }
+  };
+
 }
 
 sub insert_bulk {
@@ -2394,8 +2401,42 @@ sub _dbh_execute_inserts_with_no_binds {
 }
 
 sub update {
-  #my ($self, $source, @args) = @_;
-  shift->_execute('update', @_);
+  my ($self, $source, $update_attrs, $pk_cond) = @_;
+
+  my $columns_info  = $source->columns_info;
+  my %retrieve_cols =
+    map { $_ => $columns_info->{ $_ }->{ retrieve_on_update } }
+    grep{ $columns_info->{ $_ }->{ retrieve_on_update } }
+    keys %$columns_info;
+
+  my $sqla_opts;
+
+  if ( %retrieve_cols && $self->_use_update_returning ){
+      $sqla_opts->{returning} = [
+          sort { $retrieve_cols{$a} <=> $retrieve_cols{$b} } keys %retrieve_cols
+      ];
+  }
+
+  # If set not to return any columns: return row count only.
+  my ($rv, $sth) = $self->_execute('update', $source, $update_attrs, $pk_cond, $sqla_opts);
+  return ($rv) unless %retrieve_cols;
+
+  my %returned_cols;
+  if ( my $retlist = $sqla_opts->{ returning } ){
+    my @values = $self->_fetch_sth_returning($sth);
+    @returned_cols{ @$retlist } = @values if @values;
+  }
+  else{
+      my @cols_to_fetch = keys %retrieve_cols;
+      my $cur = DBIx::Class::ResultSet->new($source, {
+        where => $pk_cond,
+        select => \@cols_to_fetch,
+      })->cursor;
+
+      @returned_cols{@cols_to_fetch} = $cur->next;
+  }
+
+  return $rv, \%returned_cols;
 }
 
 
